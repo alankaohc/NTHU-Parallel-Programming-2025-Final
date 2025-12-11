@@ -1,25 +1,36 @@
-# 設定 C++ 編譯器
 CXX = g++
+NVCC = nvcc
 
-# C++ 編譯參數：C++11 標準、O3 最佳化
-CXXFLAGS = -std=c++11 -O3
+CXXFLAGS = -std=c++20 \
+           -O3 \
+		   -DNDEBUG \
+		   -march=native \
+		   -mtune=native \
+		   -msse4.1 \
+		   -funroll-loops \
+		   -fno-signed-zeros \
+		   -fno-trapping-math \
+		   -ftree-vectorize
 
-# 連結參數：數學函式庫 (-lm) 與 PNG 函式庫 (-lpng)
-# 注意：一定要有 -lpng 才能使用 write_png 函式
+NVCCFLAGS = -std=c++20 \
+            -O3 \
+			-DNDEBUG \
+			-Xptxas=-v \
+			-arch=sm_61
+
 LDFLAGS = -lm -lpng
 
-# 執行檔名稱
-TARGET = seq
+TARGET = seq svd_cuda
 
 .PHONY: all clean
 
 all: $(TARGET)
 
 clean:
-	rm -f $(TARGET) *.png
+	rm -f $(TARGET)
 
-# 編譯規則
-# $@ 代表目標 (seq)
-# $< 代表來源檔 (final_16.cc)
 seq: final_16.cc
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+
+svd_cuda: final_16.cu
+	$(NVCC) $(NVCCFLAGS) $(LDFLAGS) -o $@ $<
