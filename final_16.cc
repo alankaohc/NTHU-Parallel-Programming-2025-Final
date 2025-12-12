@@ -20,8 +20,9 @@ using namespace std;
 
 const double EPSILON = 1e-15;
 
+
 // ---------------------------------------------------------
-// [New] Read PNG and split into R, G, B vectors
+// [Robust] Read PNG and force convert to RGB (3 channels)
 // ---------------------------------------------------------
 void read_png(const char* filename, int& width, int& height, 
               vector<double>& r_vec, vector<double>& g_vec, vector<double>& b_vec) {
@@ -32,17 +33,15 @@ void read_png(const char* filename, int& width, int& height,
     }
 
     png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (!png_ptr) {
-        fclose(fp);
-        cerr << "Error: png_create_read_struct failed" << endl;
-        exit(1);
-    }
+    if (!png_ptr) { fclose(fp); cerr << "Error: create read struct failed" << endl; exit(1); }
 
     png_infop info_ptr = png_create_info_struct(png_ptr);
-    if (!info_ptr) {
-        png_destroy_read_struct(&png_ptr, NULL, NULL);
+    if (!info_ptr) { png_destroy_read_struct(&png_ptr, NULL, NULL); fclose(fp); cerr << "Error: create info struct failed" << endl; exit(1); }
+
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        cerr << "Error during init_io" << endl;
+        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
         fclose(fp);
-        cerr << "Error: png_create_info_struct failed" << endl;
         exit(1);
     }
 
@@ -55,22 +54,24 @@ void read_png(const char* filename, int& width, int& height,
     png_byte color_type = png_get_color_type(png_ptr, info_ptr);
     png_byte bit_depth = png_get_bit_depth(png_ptr, info_ptr);
 
-    // 轉換各種格式為標準的 8-bit RGB
-    if (bit_depth == 16) png_set_strip_16(png_ptr);
-    if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png_ptr);
-    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png_ptr);
-    if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png_ptr);
-    if (color_type == PNG_COLOR_TYPE_RGB || color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_PALETTE)
-        png_set_filler(png_ptr, 0xFF, PNG_FILLER_AFTER); // Add alpha channel filler to make it RGBA or similar alignment if needed, but easier to force RGB
+    if (bit_depth == 16) 
+        png_set_strip_16(png_ptr);
+
+    if (color_type == PNG_COLOR_TYPE_PALETTE) 
+        png_set_palette_to_rgb(png_ptr);
+
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) 
+        png_set_expand_gray_1_2_4_to_8(png_ptr);
+
+    if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS)) 
+        png_set_tRNS_to_alpha(png_ptr);
+
     if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
         png_set_gray_to_rgb(png_ptr);
 
-    // 這裡我們強制轉換並移除 Alpha，只保留 RGB
     png_set_strip_alpha(png_ptr);
-    
     png_read_update_info(png_ptr, info_ptr);
 
-    // 配置記憶體讀取 rows
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
     for (int y = 0; y < height; y++) {
         row_pointers[y] = (png_byte*)malloc(png_get_rowbytes(png_ptr, info_ptr));
@@ -78,7 +79,6 @@ void read_png(const char* filename, int& width, int& height,
 
     png_read_image(png_ptr, row_pointers);
 
-    // 將資料轉存到 vector<double> R, G, B
     r_vec.resize(width * height);
     g_vec.resize(width * height);
     b_vec.resize(width * height);
@@ -86,14 +86,15 @@ void read_png(const char* filename, int& width, int& height,
     for (int y = 0; y < height; y++) {
         png_bytep row = row_pointers[y];
         for (int x = 0; x < width; x++) {
-            png_bytep px = &(row[x * 3]); // 3 bytes per pixel (RGB)
-            r_vec[y * width + x] = static_cast<double>(px[0]);
-            g_vec[y * width + x] = static_cast<double>(px[1]);
-            b_vec[y * width + x] = static_cast<double>(px[2]);
+
+            png_bytep px = &(row[x * 3]); 
+            
+            r_vec[y * width + x] = static_cast<double>(px[0]); // R
+            g_vec[y * width + x] = static_cast<double>(px[1]); // G
+            b_vec[y * width + x] = static_cast<double>(px[2]); // B
         }
     }
 
-    // 清理 libpng 記憶體
     for (int y = 0; y < height; y++) {
         free(row_pointers[y]);
     }
@@ -175,6 +176,7 @@ void one_sided_jacobi_svd(int M, int N, const vector<double>& A,
     int max_sweeps = 15;
     
     for (int sweep = 0; sweep < max_sweeps; ++sweep) {
+        cout << "sweep " << sweep + 1 << "/" << max_sweeps << endl;
         double max_error = 0.0;
         for (int i = 0; i < N - 1; ++i) {
             for (int j = i + 1; j < N; ++j) {
@@ -283,7 +285,7 @@ int main() {
     vector<double> r_in, g_in, b_in;
     
     // 1. 讀取圖片
-    const char* input_filename = "flower.png";
+    const char* input_filename = "jerry256_byimg.png";
     read_png(input_filename, width, height, r_in, g_in, b_in);
 
     // 2. 準備輸出容器
