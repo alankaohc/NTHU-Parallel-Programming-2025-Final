@@ -1,201 +1,396 @@
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include <numeric>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#define PNG_NO_SETJMP
+
 #include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <vector>
+#include <string>
+
 #include <cuda_runtime.h>
-#include <stdio.h>
+#include <sched.h>
+#include <png.h>
 
-// =========================================================
-// [GLOBAL CONFIG] 全域設定 (大家共用，不要亂改)
-// =========================================================
-#define BLOCK_SIZE 256
-#define EPSILON 1e-15
+using namespace std;
 
-struct Pair {
-    int i;
-    int j;
-};
+constexpr double EPSILON = 1e-15;
+constexpr int BLOCK_SIZE = 128;
 
-// =========================================================
-// [MEMBER C] MATH CORE 區塊
-// 負責: 數學運算、Warp Shuffle、Givens Rotation
-// =========================================================
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA Error: %s at %s:%d\n", \
+                    cudaGetErrorString(err), __FILE__, __LINE__); \
+            exit(1); \
+        } \
+    } while (0)
 
-// 輔助: Warp 內加總 (不需要改)
-__device__ double warp_reduce_sum(double val) {
-    for (int offset = 32 / 2; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
+void read_png(const char* filename, int& width, int& height, 
+              vector<double>& r_vec, vector<double>& g_vec, vector<double>& b_vec) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        cerr << "Error: Could not open file " << filename << endl;
+        exit(1);
     }
-    return val;
-}
 
-// 核心運算函式
-__device__ void compute_and_rotate(double* s_row_i, double* s_row_j, int N) {
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
+    png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) { fclose(fp); cerr << "Error: create read struct failed" << endl; exit(1); }
 
-    // TODO [Member C]: 1. 計算局部內積 (alpha, beta, gamma)
-    // 每個人算自己負責的部分
-    double local_alpha = 0.0;
-    double local_beta = 0.0;
-    double local_gamma = 0.0;
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) { png_destroy_read_struct(&png_ptr, NULL, NULL); fclose(fp); cerr << "Error: create info struct failed" << endl; exit(1); }
 
-    // 提示: 用 stride 迴圈累加 s_row_i[k] * s_row_i[k] 等等...
-    
-    // TODO [Member C]: 2. 執行 Reduction (Warp -> Block)
-    // 先用 warp_reduce_sum，然後用 Shared Memory 把各個 Warp 的結果加起來
-    // 最終只有 Thread 0 拿到全域的 alpha, beta, gamma
-    
-    __syncthreads();
-
-    // TODO [Member C]: 3. 計算 c, s (只有 Thread 0 做)
-    __shared__ double c, s;
-    if (tid == 0) {
-        // 這裡填入 sequential code 的數學公式
-        // c = ...; s = ...;
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        cerr << "Error during init_io" << endl;
+        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+        fclose(fp);
+        exit(1);
     }
-    __syncthreads(); // 重要: 等 c, s 算好
 
-    // TODO [Member C]: 4. 更新 Shared Memory (所有 Threads 平行做)
-    // 讀取舊值 -> 旋轉 -> 寫回
-    // s_row_i[k] = c * val_i - s * val_j;
-}
+    png_init_io(png_ptr, fp);
+    png_read_info(png_ptr, info_ptr);
 
-
-// =========================================================
-// [MEMBER B] MEMORY MOVER 區塊
-// 負責: Global <-> Shared Memory 搬運 (Float4/Double2 優化)
-// =========================================================
-
-__device__ void load_rows_to_shared(double* d_data, int r1, int r2, 
-                                    double* s_r1, double* s_r2, int N) {
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
-
-    // TODO [Member B]: 從 Global Memory 搬運到 Shared Memory
-    // 挑戰題: 嘗試使用 reinterpret_cast<double2*> 進行向量化讀取 (一次讀2個double)
-    // 如果 N 保證是偶數，可以這樣加速頻寬
+    width = png_get_image_width(png_ptr, info_ptr);
+    height = png_get_image_height(png_ptr, info_ptr);
     
-    // 基本實作 (Stride Loop):
-    for (int k = tid; k < N; k += stride) {
-        // s_r1[k] = d_data[r1 * N + k]; (注意 Row-Major 的索引算式)
+    png_byte color_type = png_get_color_type(png_ptr, info_ptr);
+    png_byte bit_depth = png_get_bit_depth(png_ptr, info_ptr);
+
+    if (bit_depth == 16) 
+        png_set_strip_16(png_ptr);
+
+    if (color_type == PNG_COLOR_TYPE_PALETTE) 
+        png_set_palette_to_rgb(png_ptr);
+
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) 
+        png_set_expand_gray_1_2_4_to_8(png_ptr);
+
+    if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS)) 
+        png_set_tRNS_to_alpha(png_ptr);
+
+    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
+        png_set_gray_to_rgb(png_ptr);
+
+    png_set_strip_alpha(png_ptr);
+    png_read_update_info(png_ptr, info_ptr);
+
+    png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
+    for (int y = 0; y < height; y++) {
+        row_pointers[y] = (png_byte*)malloc(png_get_rowbytes(png_ptr, info_ptr));
     }
-}
 
-__device__ void store_rows_to_global(double* d_data, int r1, int r2, 
-                                     double* s_r1, double* s_r2, int N) {
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
+    png_read_image(png_ptr, row_pointers);
 
-    // TODO [Member B]: 把 Shared Memory 寫回 Global Memory
-    // 邏輯跟 Load 一樣，只是方向相反
-}
+    r_vec.resize(width * height);
+    g_vec.resize(width * height);
+    b_vec.resize(width * height);
 
+    for (int y = 0; y < height; y++) {
+        png_bytep row = row_pointers[y];
+        for (int x = 0; x < width; x++) {
 
-// =========================================================
-// [KERNEL] 整合區塊 (由 Member A 寫好框架，通常不需大改)
-// =========================================================
-
-__global__ void parallel_jacobi_kernel(double* A, double* V, Pair* pairs, int N) {
-    int pair_idx = blockIdx.x;
-    int r1 = pairs[pair_idx].i;
-    int r2 = pairs[pair_idx].j;
-
-    // 動態配置 Shared Memory: 大小由 Host 端決定
-    // 前半段放 Row i，後半段放 Row j
-    extern __shared__ double smem[];
-    double* s_r1 = smem;
-    double* s_r2 = smem + N;
-
-    // 1. 載入 A (Member B 工作)
-    load_rows_to_shared(A, r1, r2, s_r1, s_r2, N);
-    __syncthreads();
-
-    // 2. 運算 A (Member C 工作)
-    compute_and_rotate(s_r1, s_r2, N);
-    __syncthreads();
-
-    // 3. 寫回 A (Member B 工作)
-    store_rows_to_global(A, r1, r2, s_r1, s_r2, N);
-    __syncthreads();
-
-    // 4. 處理 V 矩陣 (重複利用 B 和 C 的功能)
-    // 載入 V -> 套用剛剛算出的旋轉 (c, s 還在 smem 裡可以用嗎? 
-    // 注意: compute_and_rotate 會重算 c,s，所以 V 的旋轉通常需要一個
-    // 簡化版的 apply_rotation_only 函式，或者由 Member C 寫在同一個函式裡判斷)
-    
-    // 簡單解法: 這裡再呼叫一次 load/store，但運算部分只做 "Apply Rotation"
-    // 為了作業方便，V 的部分可以先留白，確認 A 收斂再做
-}
-
-
-// =========================================================
-// [MEMBER A] HOST ARCHITECT 區塊
-// 負責: Main, Round-Robin 排程, Padding, I/O
-// =========================================================
-
-std::vector<Pair> generate_step_pairs(int N, const std::vector<int>& ids) {
-    std::vector<Pair> pairs;
-    // TODO [Member A]: 實作 Round Robin 配對邏輯
-    // ids[0]... 對應 ids[N-1]...
-    // 記得檢查 -1 (Dummy ID)
-    return pairs;
-}
-
-void rotate_ids(std::vector<int>& ids) {
-    // TODO [Member A]: 實作 vector 旋轉 (std::rotate)
-}
-
-int main(int argc, char** argv) {
-    // 1. 假裝讀取資料 (或是寫好 fread)
-    int N_orig = 1080; // 假設 Input 大小
-    
-    // TODO [Member A]: Padding
-    // 為了 float4/double2 優化，建議 Pad 到 2 的倍數，甚至 32 的倍數
-    int N = N_orig;
-    if (N % 2 != 0) N += 1;
-
-    // 2. 記憶體配置 (Host & Device)
-    size_t size = N * N * sizeof(double);
-    double *h_A, *d_A, *d_V;
-    // cudaMalloc...
-    
-    // 3. 初始化 Round Robin IDs
-    std::vector<int> ids(N);
-    std::iota(ids.begin(), ids.end(), 0);
-    // if (odd) ids.back() = -1;
-
-    // 4. 主迴圈
-    int max_sweeps = 15;
-    // 一個 Sweep 需要 2*N (或 N-1) 個 Steps，視 RR 實作而定
-    int steps = N - 1; 
-
-    Pair* d_pairs;
-    cudaMalloc(&d_pairs, (N/2) * sizeof(Pair));
-
-    for (int sweep = 0; sweep < max_sweeps; ++sweep) {
-        for (int step = 0; step < steps; ++step) {
+            png_bytep px = &(row[x * 3]); 
             
-            // [Member A]: 產生配對
-            std::vector<Pair> h_pairs = generate_step_pairs(N, ids);
-            
-            // [Member A]: 傳給 GPU
-            cudaMemcpy(d_pairs, h_pairs.data(), h_pairs.size() * sizeof(Pair), cudaMemcpyHostToDevice);
-
-            // [Member A]: 啟動 Kernel
-            // Grid Size = 配對數, Block Size = 256
-            // Shared Mem Size = 2 * N * sizeof(double)
-            parallel_jacobi_kernel<<<h_pairs.size(), BLOCK_SIZE, 2*N*sizeof(double)>>>(d_A, d_V, d_pairs, N);
-
-            // [Member A]: 旋轉 ID
-            rotate_ids(ids);
+            r_vec[y * width + x] = static_cast<double>(px[0]); // R
+            g_vec[y * width + x] = static_cast<double>(px[1]); // G
+            b_vec[y * width + x] = static_cast<double>(px[2]); // B
         }
     }
 
-    // 5. 收尾與輸出
-    // cudaMemcpy DeviceToHost...
-    // 驗證結果...
+    for (int y = 0; y < height; y++) {
+        free(row_pointers[y]);
+    }
+    free(row_pointers);
+    png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+    fclose(fp);
 
+    cout << "Loaded image: " << filename << " (" << width << "x" << height << ")" << endl;
+}
+
+void write_png(const char* filename, int width, int height, 
+               const vector<double>& r_vec, const vector<double>& g_vec, const vector<double>& b_vec) {
+    FILE* fp = fopen(filename, "wb");
+    if (!fp) return;
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    png_init_io(png_ptr, fp);
+    png_set_IHDR(png_ptr, info_ptr, width, height, 8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+    size_t row_size = 3 * width * sizeof(png_byte);
+    png_bytep row = (png_bytep)malloc(row_size);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int idx = y * width + x;
+            auto clamp = [](double v) -> int { int p = (int)v; return (p<0)?0:((p>255)?255:p); };
+            png_bytep color = row + x * 3;
+            color[0] = (png_byte)clamp(r_vec[idx]);
+            color[1] = (png_byte)clamp(g_vec[idx]);
+            color[2] = (png_byte)clamp(b_vec[idx]);
+        }
+        png_write_row(png_ptr, row);
+    }
+    free(row); png_write_end(png_ptr, NULL); png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp);
+    cout << "Saved: " << filename << endl;
+}
+
+__device__ double blockReduce(double* sdata, int tid, int block_dim) {
+    __syncthreads();
+    for (unsigned int s = block_dim / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    return sdata[0];
+}
+
+__global__ void svd_step_kernel_streaming(int M, int stride, double* U, double* V, int* pairs) {
+    int pair_idx = blockIdx.x;
+    int col_i = pairs[2 * pair_idx];
+    int col_j = pairs[2 * pair_idx + 1];
+    int tid = threadIdx.x;
+
+    extern __shared__ double s_red[];
+
+    double sum_aa = 0.0;
+    double sum_bb = 0.0;
+    double sum_ab = 0.0;
+
+    for (int k = tid; k < M; k += blockDim.x) {
+        double val_i = U[k * stride + col_i];
+        double val_j = U[k * stride + col_j];
+        sum_aa += val_i * val_i;
+        sum_bb += val_j * val_j;
+        sum_ab += val_i * val_j;
+    }
+
+    // 1. Reduce Alpha
+    s_red[tid] = sum_aa;
+    double alpha = blockReduce(s_red, tid, blockDim.x);
+    __syncthreads(); 
+
+    // 2. Reduce Beta
+    s_red[tid] = sum_bb;
+    double beta = blockReduce(s_red, tid, blockDim.x);
+    __syncthreads();
+
+    // 3. Reduce Gamma
+    s_red[tid] = sum_ab;
+    double gamma = blockReduce(s_red, tid, blockDim.x);
+    __syncthreads();
+
+    __shared__ double c, s;
+    __shared__ bool perform_rotation;
+
+    if (tid == 0) {
+        perform_rotation = false;
+        if (abs(gamma) > EPSILON * sqrt(alpha * beta)) {
+            perform_rotation = true;
+            double zeta = (beta - alpha) / (2.0 * gamma);
+            double sign_z = (zeta >= 0) ? 1.0 : -1.0; 
+            double t = sign_z / (abs(zeta) + sqrt(1.0 + zeta * zeta));
+            c = 1.0 / sqrt(1.0 + t * t);
+            s = c * t;
+        }
+    }
+    __syncthreads();
+
+    if (perform_rotation) {
+        for (int k = tid; k < M; k += blockDim.x) {
+            double val_i = U[k * stride + col_i];
+            double val_j = U[k * stride + col_j];
+            U[k * stride + col_i] = c * val_i - s * val_j;
+            U[k * stride + col_j] = s * val_i + c * val_j;
+        }
+
+        for (int k = tid; k < stride; k += blockDim.x) {
+            double val_i = V[k * stride + col_i];
+            double val_j = V[k * stride + col_j];
+            V[k * stride + col_i] = c * val_i - s * val_j;
+            V[k * stride + col_j] = s * val_i + c * val_j;
+        }
+    }
+}
+
+void one_sided_jacobi_svd_cuda(int M, int N, vector<double>& h_U, vector<double>& h_S, vector<double>& h_V) {
+    // 1. Initialize Identity Matrix
+    h_V.assign(N * N, 0.0);
+    for (int i = 0; i < N; ++i) h_V[i * N + i] = 1.0;
+
+    // 2. Allocate Device Memory
+    double *d_U, *d_V;
+    int *d_pairs;
+
+    size_t size_U = (size_t)M * N * sizeof(double);
+    size_t size_V = (size_t)N * N * sizeof(double);
+    size_t size_pairs = N * sizeof(int); 
+
+    CUDA_CHECK(cudaMalloc(&d_U, size_U));
+    CUDA_CHECK(cudaMalloc(&d_V, size_V));
+    CUDA_CHECK(cudaMalloc(&d_pairs, size_pairs));
+
+    CUDA_CHECK(cudaMemcpy(d_U, h_U.data(), size_U, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_V, h_V.data(), size_V, cudaMemcpyHostToDevice));
+
+    // 3. Round Robin Setup
+    std::vector<int> idx(N);
+    std::iota(idx.begin(), idx.end(), 0);
+
+    int num_pairs = N / 2;
+    int max_sweeps = 15;
+    
+    size_t shared_mem_size = BLOCK_SIZE * sizeof(double);
+
+    // 4. Main Loop
+    for (int sweep = 0; sweep < max_sweeps; ++sweep) {
+        for (int step = 0; step < N - 1; ++step) {
+            std::vector<int> current_pairs(N);
+
+            for (int i = 0; i < num_pairs; ++i) {
+                current_pairs[2 * i] = idx[i];
+                current_pairs[2 * i + 1] = idx[N - 1 - i];
+            }
+
+            CUDA_CHECK(cudaMemcpy(d_pairs, current_pairs.data(), 2 * num_pairs * sizeof(int), cudaMemcpyHostToDevice));
+            
+            svd_step_kernel_streaming<<<num_pairs, BLOCK_SIZE, shared_mem_size>>>(M, N, d_U, d_V, d_pairs);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            std::rotate(idx.begin() + 1, idx.begin() + 2, idx.end());
+        }
+    }
+
+    // 5. Retrieve Results
+    CUDA_CHECK(cudaMemcpy(h_U.data(), d_U, size_U, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_V.data(), d_V, size_V, cudaMemcpyDeviceToHost));
+
+    // 6. Compute S and Normalize U
+    h_S.resize(N);
+    for (int i = 0; i < N; ++i) {
+        double norm = 0.0;
+        for (int k = 0; k < M; ++k) norm += h_U[k * N + i] * h_U[k * N + i];
+        h_S[i] = std::sqrt(norm);
+        
+        if (h_S[i] > EPSILON) {
+            double inv_s = 1.0 / h_S[i];
+            for (int k = 0; k < M; ++k) h_U[k * N + i] *= inv_s;
+        }
+    }
+
+    // 7. Sort Singular Values
+    std::vector<std::pair<double, int>> order(N);
+    for (int i = 0; i < N; ++i) order[i] = {h_S[i], i};
+    std::sort(order.rbegin(), order.rend());
+
+    std::vector<double> sorted_S(N);
+    std::vector<double> sorted_U((size_t)M * N);
+    std::vector<double> sorted_V((size_t)N * N); 
+
+    for (int i = 0; i < N; ++i) {
+        int old_index = order[i].second;
+        sorted_S[i] = order[i].first;
+
+        for (int r = 0; r < M; ++r) sorted_U[r * N + i] = h_U[r * N + old_index];
+        for (int r = 0; r < N; ++r) sorted_V[r * N + i] = h_V[r * N + old_index];
+    }
+
+    h_S = sorted_S;
+    h_U = sorted_U;
+    h_V = sorted_V;
+
+    cudaFree(d_U); cudaFree(d_V); cudaFree(d_pairs);
+}
+
+void check(const char* name, int M, int N, const vector<double>& A, 
+           const vector<double>& U, const vector<double>& S, const vector<double>& V) {
+    
+    double frobenius_sq_error = 0.0;
+    
+    for (int r = 0; r < M; ++r) {
+        for (int c = 0; c < N; ++c) {
+            double reconstructed_val = 0.0;
+            for (int k = 0; k < N; ++k) {
+                reconstructed_val += U[r * N + k] * S[k] * V[c * N + k];
+            }
+            double diff = A[r * N + c] - reconstructed_val;
+            frobenius_sq_error += diff * diff;
+        }
+    }
+    double distance = sqrt(frobenius_sq_error);
+    cout << name << " Channel Error (Frobenius): " << scientific << distance << endl;
+}
+
+void process_channel_cuda(int width, int height, int k, 
+                          const vector<double>& input_vec, 
+                          vector<double>& output_vec, 
+                          const char* channel_name) {
+    
+    // 1. Padding
+    int stride = (width % 2 == 0) ? width : width + 1;
+    
+    vector<double> U_padded((size_t)height * stride, 0.0);
+    
+    // Copy original data with Padding
+    for(int r = 0; r < height; ++r) {
+        memcpy(&U_padded[r * stride], &input_vec[r * width], width * sizeof(double));
+    }
+
+    vector<double> S, V_padded;
+    
+    cout << "Processing " << channel_name << " (Size: " << width << "->" << stride << ")..." << endl;
+    
+    one_sided_jacobi_svd_cuda(height, stride, U_padded, S, V_padded);
+    check(channel_name, height, width, input_vec, U_padded, S, V_padded);
+
+    // Reconstruct
+    fill(output_vec.begin(), output_vec.end(), 0.0);
+    
+    for (int i = 0; i < k; ++i) {
+        double sigma = S[i];
+        for (int r = 0; r < height; ++r) {
+            for (int c = 0; c < width; ++c) {
+                output_vec[r * width + c] += sigma * U_padded[r * stride + i] * V_padded[c * stride + i];
+            }
+        }
+    }
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 4) {
+        cerr << "Usage: ./svd_cuda input.png k output.png" << endl;
+        return 1;
+    }
+    string input_filename = argv[1];
+    int k = atoi(argv[2]);
+    string output_filename = argv[3];
+
+    int width, height;
+    vector<double> r_in, g_in, b_in;
+    
+    read_png(input_filename.c_str(), width, height, r_in, g_in, b_in);
+
+    vector<double> r_out((size_t)width * height);
+    vector<double> g_out((size_t)width * height);
+    vector<double> b_out((size_t)width * height);
+
+    k = std::min(width, k);
+
+    process_channel_cuda(width, height, k, r_in, r_out, "Red");
+    process_channel_cuda(width, height, k, g_in, g_out, "Green");
+    process_channel_cuda(width, height, k, b_in, b_out, "Blue");
+
+    write_png(output_filename.c_str(), width, height, r_out, g_out, b_out);
+
+    cout << "Done." << endl;
     return 0;
 }
