@@ -15,7 +15,7 @@
 #include <vector>
 #include <string>
 
-#include <cuda_runtime.h>
+#include <cuda_runtime.h>   
 #include <sched.h>
 #include <png.h>
 
@@ -142,52 +142,63 @@ void write_png(const char* filename, int width, int height,
     cout << "Saved: " << filename << endl;
 }
 
-__device__ double blockReduce(double* sdata, int tid, int block_dim) {
-    __syncthreads();
-    for (unsigned int s = block_dim / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
+// warp shuffle (reducting 32 threads within a warp)
+__inline__ __device__ double warpReduceSum(double v) { 
+    unsigned mask = 0xffffffffu; 
+    for (int offset = 16; offset > 0; offset >>= 1) { 
+        v += __shfl_down_sync(mask, v, offset);
     }
-    return sdata[0];
+    return v;
 }
 
-__global__ void svd_step_kernel_streaming(int M, int stride, double* U, double* V, int* pairs) {
+// Block-wide reduction built from warp-level shuffles.
+// Returns the block sum in thread 0
+__inline__ __device__ double blockReduceSum(double v) { 
+    __shared__ double warp_sums[32]; 
+
+    int lane = threadIdx.x & 31; 
+    int wid  = threadIdx.x >> 5; 
+
+    // 1) Reduce within warp 
+    v = warpReduceSum(v); 
+
+    // 2) Lane 0 of each warp writes its partial sum 
+    if (lane == 0) warp_sums[wid] = v; 
+    __syncthreads(); 
+
+    // 3) First warp reduces the warp sums
+    v = (threadIdx.x < ((blockDim.x + 31) >> 5)) ? warp_sums[lane] : 0.0; 
+    if (wid == 0) v = warpReduceSum(v); 
+
+    return v; 
+}
+
+__global__ void svd_step_kernel_streaming(int M, int N, double* U, double* V, int* pairs) {
+    //   column major
+    //   U(row=k, col=c) => U[c * M + k]
+    //   V(row=r, col=c) => V[c * N + r]   
     int pair_idx = blockIdx.x;
     int col_i = pairs[2 * pair_idx];
     int col_j = pairs[2 * pair_idx + 1];
     int tid = threadIdx.x;
 
-    extern __shared__ double s_red[];
-
     double sum_aa = 0.0;
     double sum_bb = 0.0;
     double sum_ab = 0.0;
 
+    // for coalesced accumulate partial dot-products along rows k for the two columns (col_i, col_j) 
     for (int k = tid; k < M; k += blockDim.x) {
-        double val_i = U[k * stride + col_i];
-        double val_j = U[k * stride + col_j];
+        double val_i = U[col_i * M + k]; 
+        double val_j = U[col_j * M + k]; 
         sum_aa += val_i * val_i;
         sum_bb += val_j * val_j;
         sum_ab += val_i * val_j;
     }
 
-    // 1. Reduce Alpha
-    s_red[tid] = sum_aa;
-    double alpha = blockReduce(s_red, tid, blockDim.x);
-    __syncthreads(); 
-
-    // 2. Reduce Beta
-    s_red[tid] = sum_bb;
-    double beta = blockReduce(s_red, tid, blockDim.x);
-    __syncthreads();
-
-    // 3. Reduce Gamma
-    s_red[tid] = sum_ab;
-    double gamma = blockReduce(s_red, tid, blockDim.x);
-    __syncthreads();
-
+    // Using warp shuffle only needed fewer sync  
+    double alpha = blockReduceSum(sum_aa); 
+    double beta  = blockReduceSum(sum_bb); 
+    double gamma = blockReduceSum(sum_ab); 
     __shared__ double c, s;
     __shared__ bool perform_rotation;
 
@@ -196,7 +207,7 @@ __global__ void svd_step_kernel_streaming(int M, int stride, double* U, double* 
         if (abs(gamma) > EPSILON * sqrt(alpha * beta)) {
             perform_rotation = true;
             double zeta = (beta - alpha) / (2.0 * gamma);
-            double sign_z = (zeta >= 0) ? 1.0 : -1.0; 
+            double sign_z = (zeta >= 0) ? 1.0 : -1.0;
             double t = sign_z / (abs(zeta) + sqrt(1.0 + zeta * zeta));
             c = 1.0 / sqrt(1.0 + t * t);
             s = c * t;
@@ -204,27 +215,30 @@ __global__ void svd_step_kernel_streaming(int M, int stride, double* U, double* 
     }
     __syncthreads();
 
+    // Accumulate in column major indexing
     if (perform_rotation) {
         for (int k = tid; k < M; k += blockDim.x) {
-            double val_i = U[k * stride + col_i];
-            double val_j = U[k * stride + col_j];
-            U[k * stride + col_i] = c * val_i - s * val_j;
-            U[k * stride + col_j] = s * val_i + c * val_j;
+            double val_i = U[col_i * M + k]; 
+            double val_j = U[col_j * M + k]; 
+            U[col_i * M + k] = c * val_i - s * val_j; 
+            U[col_j * M + k] = s * val_i + c * val_j;
         }
 
-        for (int k = tid; k < stride; k += blockDim.x) {
-            double val_i = V[k * stride + col_i];
-            double val_j = V[k * stride + col_j];
-            V[k * stride + col_i] = c * val_i - s * val_j;
-            V[k * stride + col_j] = s * val_i + c * val_j;
+        for (int k = tid; k < N; k += blockDim.x) {
+            double val_i = V[col_i * N + k]; 
+            double val_j = V[col_j * N + k]; 
+            V[col_i * N + k] = c * val_i - s * val_j; 
+            V[col_j * N + k] = s * val_i + c * val_j; 
         }
     }
 }
 
 void one_sided_jacobi_svd_cuda(int M, int N, vector<double>& h_U, vector<double>& h_S, vector<double>& h_V) {
-    // 1. Initialize Identity Matrix
-    h_V.assign(N * N, 0.0);
-    for (int i = 0; i < N; ++i) h_V[i * N + i] = 1.0;
+    // 1. Initialize V as Identity
+    h_V.assign((size_t)N * N, 0.0);
+    for (int i = 0; i < N; ++i) {
+        h_V[i * N + i] = 1.0; 
+    }
 
     // 2. Allocate Device Memory
     double *d_U, *d_V;
@@ -232,7 +246,7 @@ void one_sided_jacobi_svd_cuda(int M, int N, vector<double>& h_U, vector<double>
 
     size_t size_U = (size_t)M * N * sizeof(double);
     size_t size_V = (size_t)N * N * sizeof(double);
-    size_t size_pairs = N * sizeof(int); 
+    size_t size_pairs = (size_t)N * sizeof(int); 
 
     CUDA_CHECK(cudaMalloc(&d_U, size_U));
     CUDA_CHECK(cudaMalloc(&d_V, size_V));
@@ -241,14 +255,14 @@ void one_sided_jacobi_svd_cuda(int M, int N, vector<double>& h_U, vector<double>
     CUDA_CHECK(cudaMemcpy(d_U, h_U.data(), size_U, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_V, h_V.data(), size_V, cudaMemcpyHostToDevice));
 
-    // 3. Round Robin Setup
+    // 3. Round Robin Setup (pair columns)
     std::vector<int> idx(N);
     std::iota(idx.begin(), idx.end(), 0);
 
     int num_pairs = N / 2;
     int max_sweeps = 15;
-    
-    size_t shared_mem_size = BLOCK_SIZE * sizeof(double);
+
+    size_t shared_mem_size = 0; // warp shuffle -> no extern dynamic shared memory
 
     // 4. Main Loop
     for (int sweep = 0; sweep < max_sweeps; ++sweep) {
@@ -256,110 +270,136 @@ void one_sided_jacobi_svd_cuda(int M, int N, vector<double>& h_U, vector<double>
             std::vector<int> current_pairs(N);
 
             for (int i = 0; i < num_pairs; ++i) {
-                current_pairs[2 * i] = idx[i];
+                current_pairs[2 * i]     = idx[i];
                 current_pairs[2 * i + 1] = idx[N - 1 - i];
             }
 
-            CUDA_CHECK(cudaMemcpy(d_pairs, current_pairs.data(), 2 * num_pairs * sizeof(int), cudaMemcpyHostToDevice));
-            
+            CUDA_CHECK(cudaMemcpy(d_pairs, current_pairs.data(), (size_t)(2 * num_pairs) * sizeof(int), cudaMemcpyHostToDevice));
+
             svd_step_kernel_streaming<<<num_pairs, BLOCK_SIZE, shared_mem_size>>>(M, N, d_U, d_V, d_pairs);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
-            
+
             std::rotate(idx.begin() + 1, idx.begin() + 2, idx.end());
         }
     }
 
-    // 5. Retrieve Results
+    // 5. Retrieve Results 
     CUDA_CHECK(cudaMemcpy(h_U.data(), d_U, size_U, cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_V.data(), d_V, size_V, cudaMemcpyDeviceToHost));
 
-    // 6. Compute S and Normalize U
+    // 6. column-wise Compute S and Normalize U
     h_S.resize(N);
     for (int i = 0; i < N; ++i) {
         double norm = 0.0;
-        for (int k = 0; k < M; ++k) norm += h_U[k * N + i] * h_U[k * N + i];
+        const size_t base = (size_t)i * M; 
+        for (int k = 0; k < M; ++k) {
+            double v = h_U[base + k]; 
+            norm += v * v;
+        }
         h_S[i] = std::sqrt(norm);
-        
+
         if (h_S[i] > EPSILON) {
             double inv_s = 1.0 / h_S[i];
-            for (int k = 0; k < M; ++k) h_U[k * N + i] *= inv_s;
+            for (int k = 0; k < M; ++k) {
+                h_U[base + k] *= inv_s; 
+            }
         }
     }
 
-    // 7. Sort Singular Values
+    // 7. Sort Singular Values (descending) and reorder columns of U and V
     std::vector<std::pair<double, int>> order(N);
     for (int i = 0; i < N; ++i) order[i] = {h_S[i], i};
     std::sort(order.rbegin(), order.rend());
 
     std::vector<double> sorted_S(N);
     std::vector<double> sorted_U((size_t)M * N);
-    std::vector<double> sorted_V((size_t)N * N); 
+    std::vector<double> sorted_V((size_t)N * N);
 
     for (int i = 0; i < N; ++i) {
         int old_index = order[i].second;
         sorted_S[i] = order[i].first;
 
-        for (int r = 0; r < M; ++r) sorted_U[r * N + i] = h_U[r * N + old_index];
-        for (int r = 0; r < N; ++r) sorted_V[r * N + i] = h_V[r * N + old_index];
+        // copy U column old_index -> new column i
+        const size_t srcU = (size_t)old_index * M; 
+        const size_t dstU = (size_t)i * M;
+        memcpy(&sorted_U[dstU], &h_U[srcU], (size_t)M * sizeof(double)); // using memcpy seems faster a bit
+
+        // copy V column old_index -> new column i
+        const size_t srcV = (size_t)old_index * N; 
+        const size_t dstV = (size_t)i * N; 
+        memcpy(&sorted_V[dstV], &h_V[srcV], (size_t)N * sizeof(double));
     }
 
-    h_S = sorted_S;
-    h_U = sorted_U;
-    h_V = sorted_V;
+    h_S = std::move(sorted_S);  //little optimize
+    h_U = std::move(sorted_U);
+    h_V = std::move(sorted_V);
 
     cudaFree(d_U); cudaFree(d_V); cudaFree(d_pairs);
 }
 
-void check(const char* name, int M, int N, const vector<double>& A, 
-           const vector<double>& U, const vector<double>& S, const vector<double>& V) {
-    
+//change to column major
+void check(const char* name, int M, int width, int N,
+           const vector<double>& A_rowmajor,
+           const vector<double>& U_colmajor, 
+           const vector<double>& S,
+           const vector<double>& V_colmajor) {
+
+    //   column-major indexing:
+    //   U(r,k) = U_colmajor[k*M + r] 
+    //   V(c,k) = V_colmajor[k*N + c] 
     double frobenius_sq_error = 0.0;
-    
+
     for (int r = 0; r < M; ++r) {
-        for (int c = 0; c < N; ++c) {
+        for (int c = 0; c < width; ++c) {
             double reconstructed_val = 0.0;
             for (int k = 0; k < N; ++k) {
-                reconstructed_val += U[r * N + k] * S[k] * V[c * N + k];
+                reconstructed_val += U_colmajor[(size_t)k * M + r] * S[k] * V_colmajor[(size_t)k * N + c]; 
             }
-            double diff = A[r * N + c] - reconstructed_val;
+            double diff = A_rowmajor[(size_t)r * width + c] - reconstructed_val;
             frobenius_sq_error += diff * diff;
         }
     }
+
     double distance = sqrt(frobenius_sq_error);
     cout << name << " Channel Error (Frobenius): " << scientific << distance << endl;
 }
 
-void process_channel_cuda(int width, int height, int k, 
-                          const vector<double>& input_vec, 
-                          vector<double>& output_vec, 
+void process_channel_cuda(int width, int height, int k,
+                          const vector<double>& input_vec,
+                          vector<double>& output_vec,
                           const char* channel_name) {
-    
+
     // 1. Padding
     int stride = (width % 2 == 0) ? width : width + 1;
-    
+
+    // 2. Build U in column-major: U(row=r, col=c) = U[c*height + r] 
     vector<double> U_padded((size_t)height * stride, 0.0);
-    
-    // Copy original data with Padding
-    for(int r = 0; r < height; ++r) {
-        memcpy(&U_padded[r * stride], &input_vec[r * width], width * sizeof(double));
+    for (int r = 0; r < height; ++r) {
+        for (int c = 0; c < width; ++c) {
+            U_padded[(size_t)c * height + r] = input_vec[(size_t)r * width + c]; 
+        }
     }
 
     vector<double> S, V_padded;
-    
-    cout << "Processing " << channel_name << " (Size: " << width << "->" << stride << ")..." << endl;
-    
-    one_sided_jacobi_svd_cuda(height, stride, U_padded, S, V_padded);
-    check(channel_name, height, width, input_vec, U_padded, S, V_padded);
 
-    // Reconstruct
+    cout << "Processing " << channel_name << " (Size: " << width << "->" << stride << ")..." << endl;
+
+    one_sided_jacobi_svd_cuda(height, stride, U_padded, S, V_padded);
+    check(channel_name, height, width, stride, input_vec, U_padded, S, V_padded);
+
+    // 3. Rank-k reconstruction back to row-major output (height x width)
     fill(output_vec.begin(), output_vec.end(), 0.0);
-    
-    for (int i = 0; i < k; ++i) {
+
+    int kk = std::min(k, width);
+    for (int i = 0; i < kk; ++i) {
         double sigma = S[i];
+        const size_t Ucol = (size_t)i * height;   // U column i base (length = height) 
+        const size_t Vcol = (size_t)i * stride;   // V column i base (length = stride) 
         for (int r = 0; r < height; ++r) {
+            double u = U_padded[Ucol + r];
             for (int c = 0; c < width; ++c) {
-                output_vec[r * width + c] += sigma * U_padded[r * stride + i] * V_padded[c * stride + i];
+                output_vec[(size_t)r * width + c] += sigma * u * V_padded[Vcol + c];
             }
         }
     }
