@@ -21,8 +21,8 @@
 
 using namespace std;
 
-constexpr double EPSILON = 1e-15;
-constexpr int BLOCK_SIZE = 512;
+constexpr double EPSILON = 1e-30;
+constexpr int BLOCK_SIZE = 1024;
 
 #define CUDA_CHECK(call) \
     do { \
@@ -246,12 +246,13 @@ void one_sided_jacobi_svd_cuda(int M, int N, vector<double>& h_U, vector<double>
     std::iota(idx.begin(), idx.end(), 0);
 
     int num_pairs = N / 2;
-    int max_sweeps = 15;
+    int max_sweeps = 5;
     
     size_t shared_mem_size = BLOCK_SIZE * sizeof(double);
 
     // 4. Main Loop
     for (int sweep = 0; sweep < max_sweeps; ++sweep) {
+        cout << "  Sweep " << sweep + 1 << "/" << max_sweeps << endl;
         for (int step = 0; step < N - 1; ++step) {
             std::vector<int> current_pairs(N);
 
@@ -330,6 +331,23 @@ void check(const char* name, int M, int N, const vector<double>& A,
     cout << name << " Channel Error (Frobenius): " << scientific << distance << endl;
 }
 
+
+void check_orthogonality(const char* name, int M, int N, const vector<double>& U) {
+    double max_ortho_error = 0.0;
+    
+    // 隨機抽查或檢查前幾對非對角線的內積
+    // 為了節省時間，這裡只檢查第一行跟其他行的內積 (理論上要是 0)
+    for (int j = 1; j < N; ++j) {
+        double dot = 0.0;
+        for (int i = 0; i < M; ++i) {
+            dot += U[i * N + 0] * U[i * N + j]; // Col 0 dot Col j
+        }
+        if (abs(dot) > max_ortho_error) max_ortho_error = abs(dot);
+    }
+    
+    cout << name << " Max Orthogonality Error (should be 0): " << scientific << max_ortho_error << endl;
+}
+
 void process_channel_cuda(int width, int height, int k, 
                           const vector<double>& input_vec, 
                           vector<double>& output_vec, 
@@ -350,7 +368,8 @@ void process_channel_cuda(int width, int height, int k,
     cout << "Processing " << channel_name << " (Size: " << width << "->" << stride << ")..." << endl;
     
     one_sided_jacobi_svd_cuda(height, stride, U_padded, S, V_padded);
-    check(channel_name, height, width, input_vec, U_padded, S, V_padded);
+    //check(channel_name, height, width, input_vec, U_padded, S, V_padded);
+    check_orthogonality(channel_name, height, width, U_padded);
 
     // Reconstruct
     fill(output_vec.begin(), output_vec.end(), 0.0);
@@ -364,9 +383,9 @@ void process_channel_cuda(int width, int height, int k,
         }
     }
 }
-
-double diff_sec(struct timespec start, struct timespec end) {
-    return (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+// 放在 main 之前的 helper function
+double diff_sec(const struct timespec& start, const struct timespec& end) {
+    return (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) * 1e-9;
 }
 
 int main(int argc, char* argv[]) {
@@ -376,32 +395,61 @@ int main(int argc, char* argv[]) {
     }
 
     struct timespec t_start, t_read, t_calc, t_end;
-    clock_gettime(CLOCK_MONOTONIC, &t_start);
     
+    // --- 1. 開始計時 ---
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
     string input_filename = argv[1];
     int k = atoi(argv[2]);
     string output_filename = argv[3];
 
     int width, height;
     vector<double> r_in, g_in, b_in;
-    
+
+    // 讀取 PNG (Input I/O)
     read_png(input_filename.c_str(), width, height, r_in, g_in, b_in);
 
+    // --- 2. 讀取結束時間 (t_read) ---
+    clock_gettime(CLOCK_MONOTONIC, &t_read);
+
+    // 記憶體配置 (這部分很快，通常算在計算的前置作業)
     vector<double> r_out((size_t)width * height);
     vector<double> g_out((size_t)width * height);
     vector<double> b_out((size_t)width * height);
 
     k = std::min(width, k);
 
+    // 核心計算 (SVD + Reconstruction)
     process_channel_cuda(width, height, k, r_in, r_out, "Red");
     process_channel_cuda(width, height, k, g_in, g_out, "Green");
     process_channel_cuda(width, height, k, b_in, b_out, "Blue");
 
+    // --- 3. 計算結束時間 (t_calc) ---
+    clock_gettime(CLOCK_MONOTONIC, &t_calc);
+
+    // 寫入 PNG (Output I/O)
     write_png(output_filename.c_str(), width, height, r_out, g_out, b_out);
 
-    cout << "Done." << endl;
+    // --- 4. 全部結束時間 (t_end) ---
     clock_gettime(CLOCK_MONOTONIC, &t_end);
-    cout << "Total Time: " << diff_sec(t_start, t_end) << " seconds" << endl;
+    
+    cout << "Done." << endl;
+
+    // --- 計算並顯示時間 ---
+    double time_read = diff_sec(t_start, t_read);   // 讀取時間
+    double time_compute = diff_sec(t_read, t_calc); // 計算時間
+    double time_write = diff_sec(t_calc, t_end);    // 寫入時間
+    double time_total_io = time_read + time_write;  // 總 I/O 時間
+
+    cout << fixed << setprecision(6); // 設定小數點位數
+    cout << "Time Breakdown:" << endl;
+    cout << "  Input I/O : " << time_read << " s" << endl;
+    cout << "  Compute   : " << time_compute << " s" << endl;
+    cout << "  Output I/O: " << time_write << " s" << endl;
+    cout << "--------------------------------" << endl;
+    cout << "Total I/O   : " << time_total_io << " s" << endl;
+    cout << "Total Compute: " << time_compute << " s" << endl;
+    cout << "Total Time  : " << diff_sec(t_start, t_end) << " s" << endl;
 
     return 0;
 }

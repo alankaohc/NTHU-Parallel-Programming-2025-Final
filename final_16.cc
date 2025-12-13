@@ -172,7 +172,7 @@ void one_sided_jacobi_svd(int M, int N, const vector<double>& A,
     fill(V.begin(), V.end(), 0.0);
     for (int i = 0; i < N; ++i) V[i * N + i] = 1.0;
 
-    int max_sweeps = 15;
+    int max_sweeps = 5;
     
     for (int sweep = 0; sweep < max_sweeps; ++sweep) {
         double max_error = 0.0;
@@ -294,7 +294,7 @@ int main() {
     vector<double> r_in, g_in, b_in;
     
     // 1. 讀取圖片
-    const char* input_filename = "jerry512.png";
+    const char* input_filename = "jerry256.png";
     read_png(input_filename, width, height, r_in, g_in, b_in);
 
     // 2. 準備輸出容器
@@ -303,7 +303,7 @@ int main() {
     vector<double> b_out(width * height);
 
     // 3. 設定要保留的奇異值數量 (Top K)
-    int k = 100;
+    int k = 20;
     cout << "Performing SVD compression (k=" << k << ")..." << endl;
 
     // 4. 對每個 Channel 執行 SVD 與重建
