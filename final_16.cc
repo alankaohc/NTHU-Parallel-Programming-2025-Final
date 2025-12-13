@@ -18,7 +18,7 @@
 
 using namespace std;
 
-const double EPSILON = 1e-15;
+const double EPSILON = 1e-5;
 
 // ---------------------------------------------------------
 // [New] Read PNG and split into R, G, B vectors
@@ -275,15 +275,26 @@ void process_channel(int w, int h, int k,
     }
 }
 
+
+double diff_sec(struct timespec start, struct timespec end) {
+    return (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+}
+
+
 // ---------------------------------------------------------
 // Main
 // ---------------------------------------------------------
 int main() {
+
+    struct timespec t_start, t_read, t_calc, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+
     int width, height;
     vector<double> r_in, g_in, b_in;
     
     // 1. 讀取圖片
-    const char* input_filename = "flower.png";
+    const char* input_filename = "jerry512.png";
     read_png(input_filename, width, height, r_in, g_in, b_in);
 
     // 2. 準備輸出容器
@@ -305,5 +316,9 @@ int main() {
     write_png("output_reconstructed.png", width, height, r_out, g_out, b_out);
 
     cout << "All operations complete." << endl;
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    cout << "Total Time: " << diff_sec(t_start, t_end) << " seconds" << endl;
+
     return 0;
 }

@@ -22,7 +22,7 @@
 using namespace std;
 
 constexpr double EPSILON = 1e-15;
-constexpr int BLOCK_SIZE = 128;
+constexpr int BLOCK_SIZE = 512;
 
 #define CUDA_CHECK(call) \
     do { \
@@ -365,11 +365,19 @@ void process_channel_cuda(int width, int height, int k,
     }
 }
 
+double diff_sec(struct timespec start, struct timespec end) {
+    return (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         cerr << "Usage: ./svd_cuda input.png k output.png" << endl;
         return 1;
     }
+
+    struct timespec t_start, t_read, t_calc, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    
     string input_filename = argv[1];
     int k = atoi(argv[2]);
     string output_filename = argv[3];
@@ -392,5 +400,8 @@ int main(int argc, char* argv[]) {
     write_png(output_filename.c_str(), width, height, r_out, g_out, b_out);
 
     cout << "Done." << endl;
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    cout << "Total Time: " << diff_sec(t_start, t_end) << " seconds" << endl;
+
     return 0;
 }
